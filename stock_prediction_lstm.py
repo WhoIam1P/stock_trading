@@ -11,6 +11,10 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 import matplotlib.pyplot as plt
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
+import matplotlib
+# 设置matplotlib支持中文显示
+matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'SimSun', 'Arial Unicode MS']  # 优先使用的中文字体
+matplotlib.rcParams['axes.unicode_minus'] = False  # 解决保存图像负号'-'显示为方块的问题
 warnings.filterwarnings('ignore')
 
 # 设置设备
@@ -284,8 +288,9 @@ def predict(save_dir, ticker_name, stock_data, stock_features, epochs=500, batch
         plt.title(f'{ticker_name} 股票价格预测')
         plt.xlabel('时间')
         plt.ylabel('价格')
-        plt.legend()
-        plt.savefig(f"{save_dir}/pic/predictions/{ticker_name}_prediction.png")
+        plt.legend(loc='best', fontsize=10)
+        plt.tight_layout()  # 自动调整布局，确保所有内容都能显示
+        plt.savefig(f"{save_dir}/pic/predictions/{ticker_name}_prediction.png", dpi=300)
         plt.close()
         
         # 绘制损失曲线
@@ -295,8 +300,9 @@ def predict(save_dir, ticker_name, stock_data, stock_features, epochs=500, batch
         plt.title(f'{ticker_name} 训练过程')
         plt.xlabel('Epoch')
         plt.ylabel('Loss')
-        plt.legend()
-        plt.savefig(f"{save_dir}/pic/loss/{ticker_name}_loss.png")
+        plt.legend(loc='best', fontsize=10)
+        plt.tight_layout()  # 自动调整布局
+        plt.savefig(f"{save_dir}/pic/loss/{ticker_name}_loss.png", dpi=300)
         plt.close()
         
         return {

@@ -9,6 +9,10 @@ from collections import deque
 import random
 import warnings
 from tqdm import tqdm
+import matplotlib
+# 设置matplotlib支持中文显示
+matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'SimSun', 'Arial Unicode MS']  # 优先使用的中文字体
+matplotlib.rcParams['axes.unicode_minus'] = False  # 解决保存图像负号'-'显示为方块的问题
 warnings.filterwarnings('ignore')
 
 # 使用CUDA如果可用
@@ -286,9 +290,10 @@ def process_stock(ticker, save_dir, window_size=10, initial_money=10000, iterati
         plt.title(f"{ticker} 交易记录")
         plt.xlabel('时间')
         plt.ylabel('价格')
-        plt.legend()
+        plt.legend(loc='best', fontsize=10)
         plt.grid(True)
-        plt.savefig(f"{save_dir}/pic/trades/{ticker}_trades.png")
+        plt.tight_layout()  # 自动调整布局，确保所有内容都能显示
+        plt.savefig(f"{save_dir}/pic/trades/{ticker}_trades.png", dpi=300)
         plt.close()
         
         # 生成收益图
@@ -298,9 +303,10 @@ def process_stock(ticker, save_dir, window_size=10, initial_money=10000, iterati
         plt.title(f"{ticker} 累计收益")
         plt.xlabel('时间')
         plt.ylabel('投资组合价值 ($)')
-        plt.legend()
+        plt.legend(loc='best', fontsize=10)
         plt.grid(True)
-        plt.savefig(f"{save_dir}/pic/earnings/{ticker}_cumulative.png")
+        plt.tight_layout()  # 自动调整布局
+        plt.savefig(f"{save_dir}/pic/earnings/{ticker}_cumulative.png", dpi=300)
         plt.close()
         
         return {
@@ -320,17 +326,19 @@ def process_stock(ticker, save_dir, window_size=10, initial_money=10000, iterati
         os.makedirs(f"{save_dir}/pic/trades", exist_ok=True)
         os.makedirs(f"{save_dir}/pic/earnings", exist_ok=True)
         
-        # 创建空白图像
+        # 创建空白图像 - 确保错误信息也能正确显示
         plt.figure(figsize=(15, 5))
         plt.title(f"{ticker} - 处理出错")
-        plt.text(0.5, 0.5, f"错误: {str(e)}", horizontalalignment='center', verticalalignment='center')
-        plt.savefig(f"{save_dir}/pic/trades/{ticker}_trades.png")
+        plt.text(0.5, 0.5, f"错误: {str(e)}", horizontalalignment='center', verticalalignment='center', fontsize=12)
+        plt.tight_layout()
+        plt.savefig(f"{save_dir}/pic/trades/{ticker}_trades.png", dpi=300)
         plt.close()
         
         plt.figure(figsize=(15, 5))
         plt.title(f"{ticker} - 处理出错")
-        plt.text(0.5, 0.5, f"错误: {str(e)}", horizontalalignment='center', verticalalignment='center')
-        plt.savefig(f"{save_dir}/pic/earnings/{ticker}_cumulative.png")
+        plt.text(0.5, 0.5, f"错误: {str(e)}", horizontalalignment='center', verticalalignment='center', fontsize=12)
+        plt.tight_layout()
+        plt.savefig(f"{save_dir}/pic/earnings/{ticker}_cumulative.png", dpi=300)
         plt.close()
         
         # 创建空的交易记录
