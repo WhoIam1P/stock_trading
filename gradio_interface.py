@@ -17,8 +17,16 @@ os.environ['NO_PROXY'] = 'localhost,127.0.0.1'
 warnings.filterwarnings("ignore")
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 SAVE_DIR = 'tmp/gradio'
+
+# 创建所有必要的目录
 os.makedirs(SAVE_DIR, exist_ok=True)
 os.makedirs('tmp/gradio/pic', exist_ok=True)
+os.makedirs('tmp/gradio/pic/predictions', exist_ok=True)
+os.makedirs('tmp/gradio/pic/loss', exist_ok=True)
+os.makedirs('tmp/gradio/pic/earnings', exist_ok=True)
+os.makedirs('tmp/gradio/pic/trades', exist_ok=True)
+os.makedirs('tmp/gradio/models', exist_ok=True)
+os.makedirs('tmp/gradio/transactions', exist_ok=True)
 os.makedirs('tmp/gradio/ticker', exist_ok=True)
 
 def get_data(ticker, start_date, end_date, progress=gr.Progress()):
@@ -38,15 +46,20 @@ def get_data(ticker, start_date, end_date, progress=gr.Progress()):
         return None, f"获取数据出错: {str(e)}"
 
 def process_and_predict(temp_csv_path, epochs, batch_size, learning_rate, 
-                       window_size, initial_money, agent_iterations, save_dir):
+                       window_size, initial_money, agent_iterations, save_dir, progress=gr.Progress()):
     if not temp_csv_path:
         return [None] * 9  # 返回空结果
         
     try:
-        ticker = os.path.basename(temp_csv_path).split('_')[0]
+        # 从文件路径中提取股票代码（去掉.csv后缀）
+        ticker = os.path.basename(temp_csv_path).split('.')[0]
+        
+        progress(0.05, desc="正在加载股票数据...")
         stock_data = pd.read_csv(temp_csv_path)
         stock_features = format_feature(stock_data)
         
+        progress(0.1, desc="开始LSTM预测训练...")
+        # 使用纯股票代码而非文件名
         metrics = predict(
             save_dir=save_dir,
             ticker_name=ticker,
@@ -57,6 +70,9 @@ def process_and_predict(temp_csv_path, epochs, batch_size, learning_rate,
             learning_rate=learning_rate
         )
         
+        progress(0.5, desc="开始交易代理训练...")
+        # 使用纯股票代码而非文件名
+        # RLagent.py已经添加了tqdm进度条，但我们在这里也提供总体进度
         trading_results = process_stock(
             ticker,
             save_dir,
@@ -65,12 +81,15 @@ def process_and_predict(temp_csv_path, epochs, batch_size, learning_rate,
             iterations=agent_iterations
         )
         
+        progress(0.9, desc="生成结果可视化...")
+        # 确保文件路径使用的是纯股票代码
         prediction_plot = Image.open(f"{save_dir}/pic/predictions/{ticker}_prediction.png")
         loss_plot = Image.open(f"{save_dir}/pic/loss/{ticker}_loss.png")
         earnings_plot = Image.open(f"{save_dir}/pic/earnings/{ticker}_cumulative.png")
         trades_plot = Image.open(f"{save_dir}/pic/trades/{ticker}_trades.png")
         transactions_df = pd.read_csv(f"{save_dir}/transactions/{ticker}_transactions.csv")
         
+        progress(1.0, desc="完成!")
         return [
             [prediction_plot, loss_plot, earnings_plot, trades_plot],
             metrics['accuracy'] * 100,
@@ -84,6 +103,8 @@ def process_and_predict(temp_csv_path, epochs, batch_size, learning_rate,
         ]
     except Exception as e:
         print(f"处理错误: {str(e)}")
+        import traceback
+        traceback.print_exc()  # 打印详细错误堆栈
         return [None] * 9
 
 with gr.Blocks() as demo:

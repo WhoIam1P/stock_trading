@@ -1,232 +1,425 @@
 import os
 import pandas as pd
 import numpy as np
-from tqdm import tqdm
+import yfinance as yf
+import warnings
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import MinMaxScaler
-import pickle
-import warnings
-from visualization import (
-    plot_stock_prediction,
-    plot_training_loss,
-    plot_cumulative_earnings,
-    plot_accuracy_comparison
-)
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import matplotlib.pyplot as plt
+from torch.cuda.amp import autocast, GradScaler
+from tqdm import tqdm
+warnings.filterwarnings('ignore')
 
-warnings.filterwarnings("ignore", category=FutureWarning)
+# 设置设备
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+class StockDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.FloatTensor(X)
+        self.y = torch.FloatTensor(y)
+    
+    def __len__(self):
+        return len(self.X)
+    
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
 
 class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers, output_size, dropout=0.2):
         super(LSTMModel, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
-        self.fc = nn.Linear(hidden_size, output_size)
+        
+        # 使用双向LSTM
+        self.lstm = nn.LSTM(
+            input_size=input_size, 
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout,
+            bidirectional=True
+        )
+        
+        # 添加批量归一化 (注意这里的大小是hidden_size * 2因为是双向LSTM)
+        self.batch_norm = nn.BatchNorm1d(hidden_size * 2)
+        
+        # 优化全连接层结构
+        self.fc_layers = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.LeakyReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.LeakyReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size // 2, output_size)
+        )
 
     def forward(self, x):
-        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(device)
-        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(device)
+        batch_size = x.size(0)
+        
+        # 初始化隐藏状态和细胞状态
+        h0 = torch.zeros(self.num_layers * 2, batch_size, self.hidden_size).to(x.device)
+        c0 = torch.zeros(self.num_layers * 2, batch_size, self.hidden_size).to(x.device)
+        
+        # LSTM层
         out, _ = self.lstm(x, (h0, c0))
-        out = self.fc(out[:, -1, :])
+        
+        # 只使用最后一个时间步的输出
+        out = out[:, -1, :]
+        
+        # 批量归一化
+        out = self.batch_norm(out)
+        
+        # 全连接层
+        out = self.fc_layers(out)
+        
         return out
 
-def get_stock_data(ticker, data_dir='data'):
-    file_path = os.path.join(data_dir, f'{ticker}.csv')
-    data = pd.read_csv(file_path, index_col='Date', parse_dates=True)
+def format_feature(df):
+    """格式化特征数据"""
+    selected_features = [
+        'Open', 'High', 'Low', 'Close', 'Volume',
+        'MA5', 'MA10', 'MA20', 'RSI', 'MACD',
+        'VWAP', 'ATR', 'ROC'
+    ]
+    
+    # 确保所有需要的特征都存在
+    for feature in selected_features:
+        if feature not in df.columns:
+            raise ValueError(f"缺少特征: {feature}")
+    
+    return df[selected_features]
+
+def create_sequences(data, seq_length):
+    """创建时间序列数据"""
+    xs, ys = [], []
+    for i in range(len(data) - seq_length):
+        x = data[i:(i + seq_length)]
+        y = data[i + seq_length, 3]  # 使用Close价格作为目标
+        xs.append(x)
+        ys.append(y)
+    return np.array(xs), np.array(ys)
+
+def predict(save_dir, ticker_name, stock_data, stock_features, epochs=500, batch_size=32, learning_rate=0.001, seq_length=60):
+    """训练LSTM模型并进行预测（优化版，支持混合精度训练）"""
+    try:
+        # 检查数据是否为空
+        if stock_data.empty or stock_features.empty:
+            raise ValueError(f"股票 {ticker_name} 的数据为空")
+        
+        if len(stock_features) < seq_length + 10:
+            raise ValueError(f"股票 {ticker_name} 的数据样本太少 ({len(stock_features)}行), 需要至少 {seq_length + 10} 行数据")
+        
+        # 显示数据信息
+        print(f"数据形状: {stock_features.shape}")
+        print(f"包含特征: {', '.join(stock_features.columns)}")
+        
+        # 检查数据中是否有NaN值
+        if stock_features.isna().any().any():
+            print("警告: 数据中存在NaN值，将进行填充")
+            # 使用前向填充策略
+            stock_features = stock_features.fillna(method='ffill')
+            # 如果还有NaN（如开头就有NaN），使用后向填充
+            stock_features = stock_features.fillna(method='bfill')
+            # 如果还有NaN（极少数情况），用0填充
+            stock_features = stock_features.fillna(0)
+        
+        # 创建保存目录
+        os.makedirs(f"{save_dir}/pic/predictions", exist_ok=True)
+        os.makedirs(f"{save_dir}/pic/loss", exist_ok=True)
+        os.makedirs(f"{save_dir}/models", exist_ok=True)
+        
+        # 数据预处理
+        scaler = MinMaxScaler()
+        scaled_data = scaler.fit_transform(stock_features)
+        
+        # 创建序列
+        X, y = create_sequences(scaled_data, seq_length)
+        
+        # 再次检查序列数据是否足够
+        if len(X) < 10:
+            raise ValueError(f"处理后的序列数据太少 ({len(X)}个样本), 无法进行有效训练")
+        
+        # 划分训练集和测试集
+        train_size = int(len(X) * 0.8)
+        X_train, X_test = X[:train_size], X[train_size:]
+        y_train, y_test = y[:train_size], y[train_size:]
+        
+        print(f"训练集大小: {len(X_train)}个样本, 测试集大小: {len(X_test)}个样本")
+        
+        # 为RTX 3060笔记本GPU（6GB显存）优化批次大小
+        optimal_batch_size = min(batch_size, 64)
+        
+        # 如果测试集太小，调整batch_size
+        if len(X_test) < optimal_batch_size:
+            optimal_batch_size = max(1, len(X_test))
+            print(f"测试集太小，调整batch_size为: {optimal_batch_size}")
+        
+        # 创建数据加载器（使用单线程模式，避免Windows多进程问题）
+        train_dataset = StockDataset(X_train, y_train)
+        test_dataset = StockDataset(X_test, y_test)
+        train_loader = DataLoader(train_dataset, batch_size=optimal_batch_size, shuffle=True, 
+                                 num_workers=0, pin_memory=False)
+        test_loader = DataLoader(test_dataset, batch_size=optimal_batch_size, 
+                               num_workers=0, pin_memory=False)
+        
+        # 初始化模型（优化隐藏层大小）
+        model = LSTMModel(
+            input_size=X_train.shape[2],
+            hidden_size=96,  # 适合6GB显存的隐藏层大小
+            num_layers=2,
+            output_size=1,
+            dropout=0.3
+        ).to(device)
+        
+        # 使用较小的初始学习率，搭配学习率调度器
+        initial_lr = learning_rate * 0.5
+        
+        # 定义损失函数和优化器
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=initial_lr, weight_decay=1e-5)
+        
+        # 使用更简单的学习率调度器避免内存问题
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
+        
+        # 混合精度训练
+        scaler = GradScaler()
+        
+        # 训练过程
+        train_losses = []
+        val_losses = []
+        
+        # 设置梯度累积步数
+        accumulation_steps = 2
+        
+        # 使用tqdm进度条显示训练进度
+        print(f"开始训练LSTM模型，将进行{epochs}轮训练...")
+        progress_bar = tqdm(range(epochs), desc="LSTM训练")
+        
+        for epoch in progress_bar:
+            model.train()
+            train_loss = 0
+            
+            for i, (batch_X, batch_y) in enumerate(train_loader):
+                batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+                
+                # 清除梯度
+                optimizer.zero_grad()
+                
+                # 使用混合精度前向传播
+                with autocast():
+                    outputs = model(batch_X)
+                    loss = criterion(outputs.squeeze(), batch_y)
+                    loss = loss / accumulation_steps  # 缩放损失以进行梯度累积
+                
+                # 使用混合精度反向传播
+                scaler.scale(loss).backward()
+                
+                # 累积梯度
+                if (i + 1) % accumulation_steps == 0:
+                    # 更新参数
+                    scaler.step(optimizer)
+                    scaler.update()
+                    scheduler.step()
+                    optimizer.zero_grad()  # 重置梯度
+                
+                train_loss += loss.item() * accumulation_steps
+            
+            # 验证
+            model.eval()
+            val_loss = 0
+            predictions = []
+            actuals = []
+            
+            with torch.no_grad():
+                for batch_X, batch_y in test_loader:
+                    batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+                    
+                    # 混合精度推理
+                    with autocast():
+                        outputs = model(batch_X)
+                        val_loss += criterion(outputs.squeeze(), batch_y).item()
+                    
+                    predictions.extend(outputs.squeeze().cpu().numpy())
+                    actuals.extend(batch_y.cpu().numpy())
+            
+            epoch_train_loss = train_loss / len(train_loader)
+            epoch_val_loss = val_loss / len(test_loader)
+            train_losses.append(epoch_train_loss)
+            val_losses.append(epoch_val_loss)
+            
+            # 更新进度条描述
+            progress_bar.set_postfix({
+                'train_loss': f'{epoch_train_loss:.4f}', 
+                'val_loss': f'{epoch_val_loss:.4f}'
+            })
+            
+            if (epoch + 1) % 50 == 0:
+                # 使用tqdm.write替代print，避免干扰进度条
+                tqdm.write(f'Epoch [{epoch+1}/{epochs}], Train Loss: {train_losses[-1]:.4f}, Val Loss: {val_losses[-1]:.4f}')
+                # 主动清理GPU缓存
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        
+        # 训练完成
+        print("LSTM模型训练完成!")
+        
+        # 保存模型
+        torch.save(model.state_dict(), f"{save_dir}/models/{ticker_name}_model.pth")
+        
+        # 计算预测指标
+        predictions = np.array(predictions)
+        actuals = np.array(actuals)
+        rmse = np.sqrt(mean_squared_error(actuals, predictions))
+        mae = mean_absolute_error(actuals, predictions)
+        accuracy = 1 - (rmse / np.mean(actuals))
+        
+        # 绘制预测结果
+        plt.figure(figsize=(12, 6))
+        plt.plot(actuals, label='实际值')
+        plt.plot(predictions, label='预测值')
+        plt.title(f'{ticker_name} 股票价格预测')
+        plt.xlabel('时间')
+        plt.ylabel('价格')
+        plt.legend()
+        plt.savefig(f"{save_dir}/pic/predictions/{ticker_name}_prediction.png")
+        plt.close()
+        
+        # 绘制损失曲线
+        plt.figure(figsize=(12, 6))
+        plt.plot(train_losses, label='训练损失')
+        plt.plot(val_losses, label='验证损失')
+        plt.title(f'{ticker_name} 训练过程')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.savefig(f"{save_dir}/pic/loss/{ticker_name}_loss.png")
+        plt.close()
+        
+        return {
+            'accuracy': accuracy,
+            'rmse': rmse,
+            'mae': mae
+        }
+    
+    except Exception as e:
+        print(f"训练过程出错: {str(e)}")
+        # 出错时主动清理GPU缓存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        raise e
+
+def calculate_technical_indicators(data, start_date=None, end_date=None):
+    """
+    计算股票的技术指标
+    
+    参数:
+        data: DataFrame, 包含OHLCV数据的DataFrame
+        start_date: str, 开始日期 (可选，用于相对表现计算)
+        end_date: str, 结束日期 (可选，用于相对表现计算)
+    
+    返回:
+        DataFrame: 添加了技术指标的数据
+    """
+    # 添加日期特征
+    data['Year'] = data.index.year
+    data['Month'] = data.index.month
+    data['Day'] = data.index.day
+    
+    # 移动平均线
+    data['MA5'] = data['Close'].shift(1).rolling(window=5).mean()
+    data['MA10'] = data['Close'].shift(1).rolling(window=10).mean()
+    data['MA20'] = data['Close'].shift(1).rolling(window=20).mean()
+    
+    # RSI指标
+    delta = data['Close'].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(window=14).mean()
+    avg_loss = loss.rolling(window=14).mean()
+    rs = avg_gain / avg_loss
+    data['RSI'] = 100 - (100 / (1 + rs))
+    
+    # MACD指标
+    exp1 = data['Close'].ewm(span=12, adjust=False).mean()
+    exp2 = data['Close'].ewm(span=26, adjust=False).mean()
+    data['MACD'] = exp1 - exp2
+    data['Signal_Line'] = data['MACD'].ewm(span=9, adjust=False).mean()
+    data['MACD_Histogram'] = data['MACD'] - data['Signal_Line']
+    
+    # VWAP指标
+    data['VWAP'] = (data['Close'] * data['Volume']).cumsum() / data['Volume'].cumsum()
+    
+    # 布林带
+    period = 20
+    data['SMA'] = data['Close'].rolling(window=period).mean()
+    data['Std_dev'] = data['Close'].rolling(window=period).std()
+    data['Upper_band'] = data['SMA'] + 2 * data['Std_dev']
+    data['Lower_band'] = data['SMA'] - 2 * data['Std_dev']
+    
+    # 相对大盘表现
+    if start_date and end_date:
+        benchmark_data = yf.download('SPY', start=start_date, end=end_date)['Close']
+        data['Relative_Performance'] = (data['Close'] / benchmark_data.values) * 100
+    
+    # ROC指标
+    data['ROC'] = data['Close'].pct_change(periods=1) * 100
+    
+    # ATR指标
+    high_low_range = data['High'] - data['Low']
+    high_close_range = abs(data['High'] - data['Close'].shift(1))
+    low_close_range = abs(data['Low'] - data['Close'].shift(1))
+    true_range = pd.concat([high_low_range, high_close_range, low_close_range], axis=1).max(axis=1)
+    data['ATR'] = true_range.rolling(window=14).mean()
+    
+    # 前一天数据
+    data[['Close_yes', 'Open_yes', 'High_yes', 'Low_yes']] = data[['Close', 'Open', 'High', 'Low']].shift(1)
+    
+    # 删除缺失值
+    data = data.dropna()
+    
     return data
 
-def format_feature(data):
-    features = [
-        'Volume', 'Year', 'Month', 'Day', 'MA5', 'MA10', 'MA20', 'RSI', 'MACD',
-        'VWAP', 'SMA', 'Std_dev', 'Upper_band', 'Lower_band', 'Relative_Performance', 'ATR',
-        'Close_yes', 'Open_yes', 'High_yes', 'Low_yes'
-    ]
-    X = data[features].iloc[1:]
-    y = data['Close'].pct_change().iloc[1:]
-    return X, y
-
-def prepare_data(data, n_steps):
-    X, y = [], []
-    for i in range(len(data) - n_steps):
-        X.append(data[i:i + n_steps])
-        y.append(data[i + n_steps])
-    return np.array(X), np.array(y)
-
-def visualize_predictions(ticker, data, predict_result, test_indices, predictions, actual_percentages, save_dir):
-    actual_prices = data['Close'].loc[test_indices].values
-    predicted_prices = np.array(predictions)
+def get_stock_data(ticker, start_date, end_date):
+    """
+    获取并处理单个股票的数据
     
-    mse = np.mean((predicted_prices - actual_prices) ** 2)
-    rmse = np.sqrt(mse)
-    mae = np.mean(np.abs(predicted_prices - actual_prices))
-    accuracy = 1 - np.mean(np.abs(predicted_prices - actual_prices) / actual_prices)
+    参数:
+        ticker: 股票代码
+        start_date: 起始日期
+        end_date: 结束日期
+    返回:
+        处理后的股票数据DataFrame
+    """
+    # 下载股票数据
+    # data = yf.download(ticker, start=start_date, end=end_date)  # 无代理
+    data = yf.download(ticker, start=start_date, end=end_date, proxy="http://127.0.0.1:7890")  # 有代理
     
-    metrics = {'rmse': rmse, 'mae': mae, 'accuracy': accuracy}
-    plot_stock_prediction(ticker, test_indices, actual_prices, predicted_prices, metrics, save_dir)
+    # 计算技术指标
+    data = calculate_technical_indicators(data, start_date, end_date)
     
-    return metrics
+    return data
 
-def train_and_predict_lstm(ticker, data, X, y, save_dir, n_steps=60, num_epochs=500, batch_size=32, learning_rate=0.001):
-    # 数据归一化和准备部分
-    scaler_y = MinMaxScaler()
-    scaler_X = MinMaxScaler()
-    scaler_y.fit(y.values.reshape(-1, 1))
-    y_scaled = scaler_y.transform(y.values.reshape(-1, 1))
-    X_scaled = scaler_X.fit_transform(X)
+def clean_csv_files(file_path):
 
-    X_train, y_train = prepare_data(X_scaled, n_steps)
-    y_train = y_scaled[n_steps-1:-1]
+    df = pd.read_csv(file_path)
+            
+    # 删除第二行和第三行
+    df = df.drop([0, 1]).reset_index(drop=True)
+            
+    # 重命名列
+    df = df.rename(columns={'Price': 'Date'})
+            
+    # 保存修改后的文件
+    df.to_csv(file_path, index=False)
+    print("所有文件处理完成！")
 
-    train_per = 0.8
-    split_index = int(train_per * len(X_train))
-    X_val = X_train[split_index-n_steps+1:]
-    y_val = y_train[split_index-n_steps+1:]
-    X_train = X_train[:split_index]
-    y_train = y_train[:split_index]
-
-    # PyTorch数据准备
-    X_train_tensor = torch.tensor(X_train, dtype=torch.float32).to(device)
-    y_train_tensor = torch.tensor(y_train, dtype=torch.float32).to(device)
-    X_val_tensor = torch.tensor(X_val, dtype=torch.float32).to(device)
-    y_val_tensor = torch.tensor(y_val, dtype=torch.float32).to(device)
-
-    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-    val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-
-    model = LSTMModel(input_size=X_train.shape[2], hidden_size=50, num_layers=2, output_size=1).to(device)
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.1)
-
-    train_losses = []
-    val_losses = []
-
-    with tqdm(total=num_epochs, desc=f"Training {ticker}", unit="epoch") as pbar:
-        for epoch in range(num_epochs):
-            # 训练和验证循环
-            model.train()
-            epoch_train_loss = 0
-            for inputs, targets in train_loader:
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                epoch_train_loss += loss.item()
-
-            avg_train_loss = epoch_train_loss / len(train_loader)
-            train_losses.append(avg_train_loss)
-
-            model.eval()
-            epoch_val_loss = 0
-            with torch.no_grad():
-                for inputs, targets in val_loader:
-                    outputs = model(inputs)
-                    val_loss = criterion(outputs, targets)
-                    epoch_val_loss += val_loss.item()
-
-            avg_val_loss = epoch_val_loss / len(val_loader)
-            val_losses.append(avg_val_loss)
-
-            pbar.set_postfix({"Train Loss": avg_train_loss, "Val Loss": avg_val_loss})
-            pbar.update(1)
-            scheduler.step()
-
-    # 使用可视化工具绘制损失曲线
-    plot_training_loss(ticker, train_losses, val_losses, save_dir)
-
-    # 预测
-    model.eval()
-    predictions = []
-    test_indices = []
-    predict_percentages = []
-    actual_percentages = []
-
-    with torch.no_grad():
-        for i in range(1 + split_index, len(X_scaled) + 1):
-            x_input = torch.tensor(X_scaled[i - n_steps:i].reshape(1, n_steps, X_train.shape[2]), 
-                                 dtype=torch.float32).to(device)
-            y_pred = model(x_input)
-            y_pred = scaler_y.inverse_transform(y_pred.cpu().numpy().reshape(-1, 1))
-            predictions.append((1 + y_pred[0][0]) * data['Close'].iloc[i - 2])
-            test_indices.append(data.index[i - 1])
-            predict_percentages.append(y_pred[0][0] * 100)
-            actual_percentages.append(y[i - 1] * 100)
-
-    # 使用可视化工具绘制累积收益率曲线
-    plot_cumulative_earnings(ticker, test_indices, actual_percentages, predict_percentages, save_dir)
-
-    predict_result = {str(date): pred / 100 for date, pred in zip(test_indices, predict_percentages)}
-    return predict_result, test_indices, predictions, actual_percentages
-
-def save_predictions_with_indices(ticker, test_indices, predictions, save_dir):
-    df = pd.DataFrame({
-        'Date': test_indices,
-        'Prediction': predictions
-    })
-
-    file_path = os.path.join(save_dir, 'predictions', f'{ticker}_predictions.pkl')
-    os.makedirs(os.path.dirname(file_path), exist_ok=True)
-    with open(file_path, 'wb') as file:
-        pickle.dump(df, file)
-
-    print(f'Saved predictions for {ticker} to {file_path}')
-
-def predict(ticker_name, stock_data, stock_features, save_dir, epochs=500, batch_size=32, learning_rate=0.001):
-    all_predictions_lstm = {}
-    prediction_metrics = {}
-
-    print(f"\nProcessing {ticker_name}")
-    data = stock_data
-    X, y = stock_features
-    
-    predict_result, test_indices, predictions, actual_percentages = train_and_predict_lstm(
-        ticker_name, data, X, y, save_dir, num_epochs=epochs, batch_size=batch_size, learning_rate=learning_rate
-    )
-    all_predictions_lstm[ticker_name] = predict_result
-    
-    metrics = visualize_predictions(ticker_name, data, predict_result, test_indices, predictions, actual_percentages, save_dir)
-    prediction_metrics[ticker_name] = metrics
-    
-    save_predictions_with_indices(ticker_name, test_indices, predictions, save_dir)
-
-    # 保存预测指标
-    os.makedirs(os.path.join(save_dir, 'output'), exist_ok=True)
-    metrics_df = pd.DataFrame(prediction_metrics).T
-    metrics_df.to_csv(os.path.join(save_dir, 'output', f'{ticker_name}_prediction_metrics.csv'))
-    print("\nPrediction metrics summary:")
-    print(metrics_df.describe())
-
-    # 使用可视化工具绘制准确度对比图
-    plot_accuracy_comparison(prediction_metrics, save_dir)
-
-    # 生成汇总报告
-    summary = {
-        'Average Accuracy': np.mean([m['accuracy'] * 100 for m in prediction_metrics.values()]),
-        'Best Stock': max(prediction_metrics.items(), key=lambda x: x[1]['accuracy'])[0],
-        'Worst Stock': min(prediction_metrics.items(), key=lambda x: x[1]['accuracy'])[0],
-        'Average RMSE': metrics_df['rmse'].mean(),
-        'Average MAE': metrics_df['mae'].mean()
-    }
-
-    # 保存汇总报告
-    with open(os.path.join(save_dir, 'output', f'{ticker_name}_prediction_summary.txt'), 'w') as f:
-        for key, value in summary.items():
-            f.write(f'{key}: {value}\n')
-
-    print("\nPrediction Summary:")
-    for key, value in summary.items():
-        print(f"{key}: {value}")
-
-    return metrics
-
-if __name__ == "__main__":
+def main():
+    """主函数：执行数据收集和处理流程"""
+    # 股票分类列表
     tickers = [
         'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA',       # 科技
         'JPM', 'BAC', 'C', 'WFC', 'GS',                # 金融
@@ -236,13 +429,26 @@ if __name__ == "__main__":
         'CAT', 'DE', 'MMM', 'GE', 'HON'                # 工业
     ]
 
-    save_dir = 'results'  # 设置保存目录
-    for ticker_name in tickers:
-        stock_data = get_stock_data(ticker_name)
-        stock_features = format_feature(stock_data)
-        predict(
-            ticker_name=ticker_name,
-            stock_data=stock_data,
-            stock_features=stock_features,
-            save_dir=save_dir
-        )
+    # 设置参数
+    START_DATE = '2020-01-01'
+    END_DATE = '2024-01-01'
+    NUM_FEATURES_TO_KEEP = 9
+    
+    # 创建数据文件夹
+    data_folder = 'data'
+    os.makedirs(data_folder, exist_ok=True)
+    
+    # 获取并保存所有股票数据
+    print("开始下载和处理股票数据...")
+    for ticker in tickers:
+        try:
+            print(f"处理 {ticker} 中...")
+            stock_data = get_stock_data(ticker, START_DATE, END_DATE)
+            stock_data.to_csv(f'{data_folder}/{ticker}.csv')
+            clean_csv_files(f'{data_folder}/{ticker}.csv')
+            print(f"{ticker} 处理完成")
+        except Exception as e:
+            print(f"处理 {ticker} 时出错: {str(e)}")
+
+if __name__ == "__main__":
+    main()

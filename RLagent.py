@@ -1,278 +1,349 @@
-import numpy as np
 import os
+import numpy as np
 import pandas as pd
-import time
 import matplotlib.pyplot as plt
-import seaborn as sns
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from collections import deque
 import random
-from visualization import plot_trading_result
-sns.set()
+import warnings
+from tqdm import tqdm
+warnings.filterwarnings('ignore')
 
-class Deep_Evolution_Strategy:
-    """
-    深度进化策略类
+# 使用CUDA如果可用
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+class DQNModel(nn.Module):
+    def __init__(self, state_size, action_size):
+        super(DQNModel, self).__init__()
+        self.network = nn.Sequential(
+            nn.Linear(state_size, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, action_size)
+        )
     
-    参数:
-        weights: 模型权重
-        reward_function: 奖励函数
-        population_size: 种群大小
-        sigma: 扰动标准差
-        learning_rate: 学习率
-    """
-    def __init__(self, weights, reward_function, population_size, sigma, learning_rate):
-        self.weights = weights
-        self.reward_function = reward_function
-        self.population_size = population_size
-        self.sigma = sigma
-        self.learning_rate = learning_rate
-
-    def _get_weight_from_population(self, weights, population):
-        """生成扰动后的权重"""
-        weights_population = []
-        for index, i in enumerate(population):
-            jittered = self.sigma * i
-            weights_population.append(weights[index] + jittered)
-        return weights_population
-
-    def get_weights(self):
-        """获取当前权重"""
-        return self.weights
-
-    def train(self, epoch=100, print_every=1):
-        """
-        训练模型
-        
-        参数:
-            epoch: 训练轮数
-            print_every: 打印频率
-        """
-        lasttime = time.time()
-        for i in range(epoch):
-            population = []
-            rewards = np.zeros(self.population_size)
-            # 生成种群
-            for k in range(self.population_size):
-                x = []
-                for w in self.weights:
-                    x.append(np.random.randn(*w.shape))
-                population.append(x)
-            # 计算每个个体的奖励
-            for k in range(self.population_size):
-                weights_population = self._get_weight_from_population(self.weights, population[k])
-                rewards[k] = self.reward_function(weights_population)
-            # 标准化奖励
-            rewards = (rewards - np.mean(rewards)) / (np.std(rewards) + 1e-7)
-            # 更新权重
-            for index, w in enumerate(self.weights):
-                A = np.array([p[index] for p in population])
-                self.weights[index] = (
-                    w
-                    + self.learning_rate
-                    / (self.population_size * self.sigma)
-                    * np.dot(A.T, rewards).T
-                )
-            if (i + 1) % print_every == 0:
-                print('iter %d. reward: %f' % (i + 1, self.reward_function(self.weights)))
-        print('time taken to train:', time.time() - lasttime, 'seconds')
-
-
-class Model:
-    """
-    神经网络模型类
-    
-    参数:
-        input_size: 输入维度
-        layer_size: 隐藏层大小
-        output_size: 输出维度
-    """
-    def __init__(self, input_size, layer_size, output_size):
-        self.weights = [
-            np.random.randn(input_size, layer_size),
-            np.random.randn(layer_size, output_size),
-            np.random.randn(1, layer_size),
-        ]
-
-    def predict(self, inputs):
-        """预测函数"""
-        feed = np.dot(inputs, self.weights[0]) + self.weights[-1]
-        decision = np.dot(feed, self.weights[1])
-        return decision
-
-    def get_weights(self):
-        """获取模型权重"""
-        return self.weights
-
-    def set_weights(self, weights):
-        """设置模型权重"""
-        self.weights = weights
-
+    def forward(self, x):
+        return self.network(x)
 
 class Agent:
-    """
-    交易代理类
+    def __init__(self, state_size, action_size=3, is_eval=False, model_name=""):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.memory = deque(maxlen=1000)
+        self.inventory = []
+        self.model_name = model_name
+        self.is_eval = is_eval
+        
+        # 超参数
+        self.gamma = 0.95
+        self.epsilon = 1.0
+        self.epsilon_min = 0.01
+        self.epsilon_decay = 0.995
+        self.batch_size = 32
+        
+        # 创建模型
+        self.model = DQNModel(state_size, action_size).to(device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        self.criterion = nn.MSELoss()
+        
+    def act(self, state):
+        # 探索
+        if not self.is_eval and np.random.rand() <= self.epsilon:
+            return np.random.randint(self.action_size)
+        
+        # 利用
+        with torch.no_grad():
+            state_tensor = torch.FloatTensor(state).to(device)
+            q_values = self.model(state_tensor)
+            return torch.argmax(q_values).item()
     
-    参数:
-        model: 预测模型
-        window_size: 时间窗口大小
-        trend: 价格序列
-        skip: 跳过步数
-        initial_money: 初始资金
-        ticker: 股票代码
-    """
-    POPULATION_SIZE = 15
-    SIGMA = 0.1
-    LEARNING_RATE = 0.03
+    def remember(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, done))
+    
+    def replay(self):
+        if len(self.memory) < self.batch_size:
+            return
+        
+        # 随机采样
+        minibatch = random.sample(self.memory, self.batch_size)
+        
+        for state, action, reward, next_state, done in minibatch:
+            state_tensor = torch.FloatTensor(state).to(device)
+            next_state_tensor = torch.FloatTensor(next_state).to(device)
+            
+            with torch.no_grad():
+                target = reward
+                if not done:
+                    target += self.gamma * torch.max(self.model(next_state_tensor))
+            
+            # 前向传播获取当前Q值
+            current_q = self.model(state_tensor)
+            target_q = current_q.clone()
+            target_q[0, action] = target
+            
+            # 计算损失并更新模型
+            self.optimizer.zero_grad()
+            loss = self.criterion(current_q, target_q)
+            loss.backward()
+            self.optimizer.step()
+        
+        # 衰减探索率
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
 
-    def __init__(self, model, window_size, trend, skip, initial_money, ticker, save_dir):
-        self.model = model
-        self.window_size = window_size
-        self.half_window = window_size // 2
-        self.trend = trend
-        self.skip = skip
-        self.initial_money = initial_money
-        self.ticker = ticker
-        self.save_dir = save_dir
-        self.es = Deep_Evolution_Strategy(
-            self.model.get_weights(),
-            self.get_reward,
-            self.POPULATION_SIZE,
-            self.SIGMA,
-            self.LEARNING_RATE,
-        )
+def sigmoid(x):
+    """缩放价格变化的sigmoid函数"""
+    return 1 / (1 + np.exp(-x))
 
-    def act(self, sequence):
-        """根据当前状态选择行动"""
-        decision = self.model.predict(np.array(sequence))
-        return np.argmax(decision[0])
-
-    def get_state(self, t):
-        """获取当前状态"""
-        window_size = self.window_size + 1
+def get_state(data, t, window_size):
+    """生成状态表示"""
+    if t < window_size:
+        # 如果时间步小于窗口大小，填充前面的数据
         d = t - window_size + 1
-        block = self.trend[d: t + 1] if d >= 0 else -d * [self.trend[0]] + self.trend[0: t + 1]
-        res = []
-        for i in range(window_size - 1):
-            res.append(block[i + 1] - block[i])
-        return np.array([res])
+        block = data[0:t+1]
+        if d < 0:
+            block = np.pad(block, (abs(d), 0), 'constant', constant_values=(block[0]))
+    else:
+        block = data[t-window_size+1:t+1]
+    
+    res = []
+    for i in range(window_size - 1):
+        res.append(sigmoid(block[i+1] - block[i]))
+    
+    return np.array([res])
 
-    def get_reward(self, weights):
-        """计算奖励值"""
-        initial_money = self.initial_money
-        starting_money = initial_money
-        self.model.weights = weights
-        state = self.get_state(0)
-        inventory = []
-        
-        for t in range(0, len(self.trend) - 1, self.skip):
-            action = self.act(state)
-            next_state = self.get_state(t + 1)
-
-            if action == 1 and starting_money >= self.trend[t]:
-                inventory.append(self.trend[t])
-                starting_money -= self.trend[t]
-
-            elif action == 2 and len(inventory):
-                bought_price = inventory.pop(0)
-                starting_money += self.trend[t]
-
-            state = next_state
-        return ((starting_money - initial_money) / initial_money) * 100
-
-    def fit(self, iterations, checkpoint):
-        """训练代理"""
-        self.es.train(iterations, print_every=checkpoint)
-
-    def buy(self, save_dir):
-        """执行交易策略"""
-        initial_money = self.initial_money
-        state = self.get_state(0)
-        starting_money = initial_money
-        states_sell = []
-        states_buy = []
-        inventory = []
-        transaction_history = []
-
-        for t in range(0, len(self.trend) - 1, self.skip):
-            action = self.act(state)
-            next_state = self.get_state(t + 1)
-
-            if action == 1 and initial_money >= self.trend[t]:
-                inventory.append(self.trend[t])
-                initial_money -= self.trend[t]
-                states_buy.append(t)
-                transaction_history.append({
-                    'day': t,
-                    'operate': 'buy',
-                    'price': self.trend[t],
-                    'investment': 0,
-                    'total_balance': initial_money
-                })
-
-            elif action == 2 and len(inventory):
-                bought_price = inventory.pop(0)
-                initial_money += self.trend[t]
-                states_sell.append(t)
-                try:
-                    invest = ((self.trend[t] - bought_price) / bought_price) * 100
-                except:
-                    invest = 0
-                transaction_history.append({
-                    'day': t,
-                    'operate': 'sell',
-                    'price': self.trend[t],
-                    'investment': invest,
-                    'total_balance': initial_money
-                })
-
-            state = next_state
-
-        # 保存交易历史
-        df_transaction = pd.DataFrame(transaction_history)
-        os.makedirs(f'{save_dir}/transactions', exist_ok=True)
-        df_transaction.to_csv(f'{save_dir}/transactions/{self.ticker}_transactions.csv', index=False)
-
-        invest = ((initial_money - starting_money) / starting_money) * 100
-        total_gains = initial_money - starting_money
-        return states_buy, states_sell, total_gains, invest
-
-
-def process_stock(ticker, save_dir, window_size = 30, initial_money = 10000, iterations=500):
+def process_stock(ticker, save_dir, window_size=10, initial_money=10000, iterations=500):
+    """处理单只股票的交易模拟"""
     try:
-        # 读取预测数据
-        df = pd.read_pickle(f'{save_dir}/predictions/{ticker}_predictions.pkl')
-        print(f"\nProcessing {ticker}")
-        close = df.Prediction.values.tolist()
-
-        # 设置参数
-        window_size = window_size
-        skip = 1
-        initial_money = initial_money
-
-        # 创建模型和代理
-        model = Model(input_size=window_size, layer_size=500, output_size=3)
-        agent = Agent(model=model, window_size=window_size, trend=close, 
-                     skip=skip, initial_money=initial_money, ticker=ticker, save_dir=save_dir)
+        # 创建必要的目录
+        os.makedirs(f"{save_dir}/models", exist_ok=True)
+        os.makedirs(f"{save_dir}/pic/trades", exist_ok=True)
+        os.makedirs(f"{save_dir}/pic/earnings", exist_ok=True)
+        os.makedirs(f"{save_dir}/transactions", exist_ok=True)
         
-        # 训练代理
-        agent.fit(iterations=iterations, checkpoint=10)
+        # 确保ticker不包含扩展名
+        ticker = ticker.replace('.csv', '')
+        
+        # 读取数据
+        file_path = f"{save_dir}/ticker/{ticker}.csv"
+        print(f"正在读取文件: {file_path}")
+        stock_data = pd.read_csv(file_path)
+        
+        if stock_data.empty:
+            raise ValueError(f"股票 {ticker} 的数据为空")
+        
+        # 获取收盘价
+        if 'Close' not in stock_data.columns:
+            raise ValueError(f"股票数据中缺少Close列，可用列: {stock_data.columns.tolist()}")
 
-        # 执行交易并获取结果
-        states_buy, states_sell, total_gains, invest = agent.buy(save_dir)
+        # 显示数据信息
+        print(f"数据形状: {stock_data.shape}")
+        print(f"包含列: {', '.join(stock_data.columns)}")
+        
+        close_prices = stock_data['Close'].values
+        
+        # 检查数据是否足够
+        if len(close_prices) < window_size * 3:
+            raise ValueError(f"数据样本太少，至少需要 {window_size * 3} 行数据")
+            
+        # 划分训练集和测试集
+        split = int(0.7 * len(close_prices))
+        train_data = close_prices[:split]
+        test_data = close_prices[split:]
+        
+        print(f"训练集: {len(train_data)} 样本, 测试集: {len(test_data)} 样本")
+        
+        # 初始化智能体
+        agent = Agent(window_size - 1)
+        
+        # 训练模式
+        print(f"开始训练智能体，迭代 {iterations} 次...")
+        for e in tqdm(range(iterations), desc="训练进度"):
+            state = get_state(train_data, 0, window_size)
+            total_profit = 0
+            agent.inventory = []
+            
+            for t in range(1, len(train_data) - 1):
+                action = agent.act(state)
+                next_state = get_state(train_data, t, window_size)
+                reward = 0
 
-        # 使用可视化工具绘制交易图
-        plot_trading_result(ticker, close, states_buy, states_sell, total_gains, invest, save_dir)
+                # 买入
+                if action == 1:
+                    agent.inventory.append(train_data[t])
+                
+                # 卖出
+                elif action == 2 and len(agent.inventory) > 0:
+                    bought_price = agent.inventory.pop(0)
+                    reward = max(0, train_data[t] - bought_price)
+                    total_profit += train_data[t] - bought_price
+                
+                done = t == len(train_data) - 2
+                agent.remember(state, action, reward, next_state, done)
+                state = next_state
+                
+                # 每隔100步或训练结束时才调用replay
+                if t % 100 == 0 or done:
+                    agent.replay()
+                
+                if done and e % 10 == 0:
+                    tqdm.write(f"回合: {e+1}/{iterations}, 训练利润: {total_profit:.2f}")
+        
+        # 保存模型
+        torch.save(agent.model.state_dict(), f"{save_dir}/models/{ticker}_dqn.pth")
+        
+        # 测试模式
+        agent.is_eval = True
+        agent.epsilon = 0  # 不再探索
+        
+        print("开始测试交易策略...")
+        state = get_state(test_data, 0, window_size)
+        total_profit = 0
+        agent.inventory = []
+        
+        history = []
+        balance = initial_money
+        buy_dates = []
+        sell_dates = []
+        buy_prices = []
+        sell_prices = []
+        transactions = []
+        
+        for t in tqdm(range(1, len(test_data) - 1), desc="测试进度"):
+            action = agent.act(state)
+            next_state = get_state(test_data, t, window_size)
+            
+            # 计算当前持仓价值
+            holding_value = sum(agent.inventory)
+            current_value = balance + holding_value
+            history.append(current_value)
+            
+            # 买入
+            if action == 1 and balance > test_data[t]:
+                agent.inventory.append(test_data[t])
+                balance -= test_data[t]
+                buy_dates.append(t)
+                buy_prices.append(test_data[t])
+                
+                transactions.append({
+                    'day': t,
+                    'operate': '买入',
+                    'price': test_data[t],
+                    'investment': test_data[t],
+                    'total_balance': balance + sum(agent.inventory)
+                })
+                
+            # 卖出
+            elif action == 2 and len(agent.inventory) > 0:
+                bought_price = agent.inventory.pop(0)
+                balance += test_data[t]
+                total_profit += test_data[t] - bought_price
+                sell_dates.append(t)
+                sell_prices.append(test_data[t])
+                
+                transactions.append({
+                    'day': t,
+                    'operate': '卖出',
+                    'price': test_data[t],
+                    'investment': test_data[t],
+                    'total_balance': balance + sum(agent.inventory)
+                })
+            
+            state = next_state
+        
+        # 计算最终价值和回报率
+        final_value = balance + sum([test_data[-1]] * len(agent.inventory))
+        invest_return = ((final_value - initial_money) / initial_money) * 100
+        
+        print(f"初始资金: ${initial_money:.2f}")
+        print(f"最终资金: ${final_value:.2f}")
+        print(f"总收益: ${final_value - initial_money:.2f}")
+        print(f"投资回报率: {invest_return:.2f}%")
+        print(f"买入次数: {len(buy_dates)}")
+        print(f"卖出次数: {len(sell_dates)}")
+        
+        # 保存交易记录
+        transactions_df = pd.DataFrame(transactions)
+        if not transactions_df.empty:
+            transactions_df.to_csv(f"{save_dir}/transactions/{ticker}_transactions.csv", index=False)
+        else:
+            # 创建一个空的交易记录文件
+            pd.DataFrame(columns=['day', 'operate', 'price', 'investment', 'total_balance']
+                        ).to_csv(f"{save_dir}/transactions/{ticker}_transactions.csv", index=False)
+        
+        # 生成交易图
+        plt.figure(figsize=(15, 5))
+        plt.plot(test_data, label='股票价格', color='black', alpha=0.5)
+        
+        if buy_dates:
+            plt.scatter(buy_dates, [test_data[i] for i in buy_dates], marker='^', c='green', alpha=1, s=100, label='买入')
+        if sell_dates:
+            plt.scatter(sell_dates, [test_data[i] for i in sell_dates], marker='v', c='red', alpha=1, s=100, label='卖出')
+        
+        plt.title(f"{ticker} 交易记录")
+        plt.xlabel('时间')
+        plt.ylabel('价格')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(f"{save_dir}/pic/trades/{ticker}_trades.png")
+        plt.close()
+        
+        # 生成收益图
+        plt.figure(figsize=(15, 5))
+        plt.plot(history, label='投资组合价值', color='blue')
+        plt.axhline(y=initial_money, color='r', linestyle='-', label='初始投资')
+        plt.title(f"{ticker} 累计收益")
+        plt.xlabel('时间')
+        plt.ylabel('投资组合价值 ($)')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(f"{save_dir}/pic/earnings/{ticker}_cumulative.png")
+        plt.close()
         
         return {
-            'total_gains': total_gains,
-            'investment_return': invest,
-            'trades_buy': len(states_buy),
-            'trades_sell': len(states_sell)
+            'total_gains': final_value - initial_money,
+            'investment_return': invest_return,
+            'trades_buy': len(buy_dates),
+            'trades_sell': len(sell_dates)
         }
-        
+    
     except Exception as e:
-        print(f"Error processing {ticker}: {e}")
-        return None
-
+        print(f"处理股票 {ticker} 出错: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        
+        # 确保创建空文件以避免后续处理错误
+        os.makedirs(f"{save_dir}/transactions", exist_ok=True)
+        os.makedirs(f"{save_dir}/pic/trades", exist_ok=True)
+        os.makedirs(f"{save_dir}/pic/earnings", exist_ok=True)
+        
+        # 创建空白图像
+        plt.figure(figsize=(15, 5))
+        plt.title(f"{ticker} - 处理出错")
+        plt.text(0.5, 0.5, f"错误: {str(e)}", horizontalalignment='center', verticalalignment='center')
+        plt.savefig(f"{save_dir}/pic/trades/{ticker}_trades.png")
+        plt.close()
+        
+        plt.figure(figsize=(15, 5))
+        plt.title(f"{ticker} - 处理出错")
+        plt.text(0.5, 0.5, f"错误: {str(e)}", horizontalalignment='center', verticalalignment='center')
+        plt.savefig(f"{save_dir}/pic/earnings/{ticker}_cumulative.png")
+        plt.close()
+        
+        # 创建空的交易记录
+        pd.DataFrame(columns=['day', 'operate', 'price', 'investment', 'total_balance']
+                   ).to_csv(f"{save_dir}/transactions/{ticker}_transactions.csv", index=False)
+        
+        # 返回空结果
+        return {
+            'total_gains': 0,
+            'investment_return': 0,
+            'trades_buy': 0,
+            'trades_sell': 0
+        }
 
 def main():
     """主函数：执行所有股票的交易策略"""
@@ -289,7 +360,6 @@ def main():
     # 处理每只股票
     for ticker in tickers:
         process_stock(ticker, save_dir)
-
 
 if __name__ == "__main__":
     main()
