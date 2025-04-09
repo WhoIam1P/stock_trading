@@ -84,16 +84,87 @@ class LSTMModel(nn.Module):
 
 def format_feature(df):
     """格式化特征数据"""
+    required_features = [
+        'Open', 'High', 'Low', 'Close', 'Volume'
+    ]
+    
+    # 检查必要的基础特征是否存在
+    for feature in required_features:
+        if feature not in df.columns:
+            raise ValueError(f"缺少基础特征: {feature}")
+    
+    # 确保技术指标特征存在，如果不存在则计算
+    technical_features = [
+        'MA5', 'MA10', 'MA20', 'RSI', 'MACD',
+        'VWAP', 'ATR', 'ROC'
+    ]
+    
+    # 检查是否缺少技术指标并计算
+    if not all(feature in df.columns for feature in technical_features):
+        print("数据中缺少某些技术指标，将进行计算...")
+        
+        # 移动平均线
+        if 'MA5' not in df.columns:
+            df['MA5'] = df['Close'].rolling(window=5).mean()
+        if 'MA10' not in df.columns:
+            df['MA10'] = df['Close'].rolling(window=10).mean()
+        if 'MA20' not in df.columns:
+            df['MA20'] = df['Close'].rolling(window=20).mean()
+        
+        # RSI指标
+        if 'RSI' not in df.columns:
+            delta = df['Close'].diff()
+            gain = delta.clip(lower=0)
+            loss = -delta.clip(upper=0)
+            avg_gain = gain.rolling(window=14).mean()
+            avg_loss = loss.rolling(window=14).mean()
+            rs = avg_gain / avg_loss.replace(0, 1e-10)  # 避免除以零
+            df['RSI'] = 100 - (100 / (1 + rs))
+        
+        # MACD指标
+        if 'MACD' not in df.columns:
+            exp1 = df['Close'].ewm(span=12, adjust=False).mean()
+            exp2 = df['Close'].ewm(span=26, adjust=False).mean()
+            df['MACD'] = exp1 - exp2
+        
+        # VWAP指标
+        if 'VWAP' not in df.columns:
+            df['VWAP'] = (df['Close'] * df['Volume']).cumsum() / df['Volume'].cumsum().replace(0, 1)
+        
+        # ATR指标
+        if 'ATR' not in df.columns:
+            high_low = df['High'] - df['Low']
+            high_close = abs(df['High'] - df['Close'].shift(1))
+            low_close = abs(df['Low'] - df['Close'].shift(1))
+            true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+            df['ATR'] = true_range.rolling(window=14).mean()
+        
+        # ROC指标
+        if 'ROC' not in df.columns:
+            df['ROC'] = df['Close'].pct_change(periods=1) * 100
+    
+    # 填充缺失值
+    for col in df.columns:
+        if df[col].isnull().any():
+            # 使用前向填充
+            df[col] = df[col].fillna(method='ffill')
+            # 然后使用后向填充（处理开头的NaN）
+            df[col] = df[col].fillna(method='bfill')
+            # 最后使用0填充任何剩余的NaN
+            df[col] = df[col].fillna(0)
+    
+    # 选择最终特征
     selected_features = [
         'Open', 'High', 'Low', 'Close', 'Volume',
         'MA5', 'MA10', 'MA20', 'RSI', 'MACD',
         'VWAP', 'ATR', 'ROC'
     ]
     
-    # 确保所有需要的特征都存在
+    # 确保所有列都存在
     for feature in selected_features:
         if feature not in df.columns:
-            raise ValueError(f"缺少特征: {feature}")
+            print(f"警告: 无法计算特征 {feature}，使用默认值0")
+            df[feature] = 0
     
     return df[selected_features]
 

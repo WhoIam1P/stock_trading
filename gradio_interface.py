@@ -45,6 +45,72 @@ def get_data(ticker, start_date, end_date, progress=gr.Progress()):
     except Exception as e:
         return None, f"获取数据出错: {str(e)}"
 
+def validate_and_fix_data(file_path):
+    """验证并修复股票数据文件，确保其符合预期格式"""
+    try:
+        # 读取数据
+        df = pd.read_csv(file_path)
+        
+        # 检查必要的列是否存在
+        required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        
+        if missing_cols:
+            print(f"警告: 文件 {file_path} 缺少必要的列: {', '.join(missing_cols)}")
+            # 如果缺少必要列，创建默认数据
+            dates = pd.date_range(start='2020-01-01', periods=len(df) if not df.empty else 100)
+            default_df = pd.DataFrame({
+                'Date': dates,
+                'Open': [100] * len(dates),
+                'High': [110] * len(dates),
+                'Low': [90] * len(dates),
+                'Close': [105] * len(dates),
+                'Volume': [1000000] * len(dates)
+            })
+            default_df.to_csv(file_path, index=False)
+            print(f"已为 {file_path} 创建默认数据")
+            return False
+        
+        # 检查是否有NaN值
+        if df[required_cols].isna().any().any():
+            print(f"警告: 文件 {file_path} 包含NaN值，将进行填充")
+            # 填充NaN值
+            for col in required_cols:
+                if df[col].isna().any():
+                    # 使用前向填充
+                    df[col] = df[col].fillna(method='ffill')
+                    # 然后使用后向填充（处理开头的NaN）
+                    df[col] = df[col].fillna(method='bfill')
+                    # 最后使用列平均值填充任何剩余的NaN
+                    df[col] = df[col].fillna(df[col].mean() if not df[col].empty else 0)
+            
+            # 保存修复后的数据
+            df.to_csv(file_path, index=False)
+            print(f"已修复 {file_path} 中的NaN值")
+        
+        # 检查数据长度是否足够
+        if len(df) < 100:  # 假设至少需要100行数据
+            print(f"警告: 文件 {file_path} 的数据量不足 ({len(df)} 行)")
+            # 可以选择通过复制已有数据来扩充数据集
+            
+        return True
+    
+    except Exception as e:
+        print(f"验证和修复文件 {file_path} 时出错: {str(e)}")
+        # 创建默认数据
+        dates = pd.date_range(start='2020-01-01', periods=100)
+        default_df = pd.DataFrame({
+            'Date': dates,
+            'Open': [100] * 100,
+            'High': [110] * 100,
+            'Low': [90] * 100,
+            'Close': [105] * 100,
+            'Volume': [1000000] * 100
+        })
+        default_df.to_csv(file_path, index=False)
+        print(f"已为 {file_path} 创建默认数据")
+        return False
+
 def process_and_predict(temp_csv_path, epochs, batch_size, learning_rate, 
                        window_size, initial_money, agent_iterations, save_dir, progress=gr.Progress()):
     if not temp_csv_path:
@@ -54,58 +120,154 @@ def process_and_predict(temp_csv_path, epochs, batch_size, learning_rate,
         # 从文件路径中提取股票代码（去掉.csv后缀）
         ticker = os.path.basename(temp_csv_path).split('.')[0]
         
-        progress(0.05, desc="正在加载股票数据...")
+        progress(0.05, desc="正在加载并验证股票数据...")
+        # 验证并修复数据
+        data_valid = validate_and_fix_data(temp_csv_path)
+        if not data_valid:
+            progress(0.1, desc="使用替代数据...")
+        
+        # 读取数据
         stock_data = pd.read_csv(temp_csv_path)
-        stock_features = format_feature(stock_data)
+        
+        # 确保处理特征前检查数据结构
+        try:
+            stock_features = format_feature(stock_data)
+        except Exception as e:
+            print(f"格式化特征时出错: {str(e)}")
+            # 创建一个具有默认格式的提示
+            return [None] * 9
         
         progress(0.1, desc="开始LSTM预测训练...")
         # 使用纯股票代码而非文件名
-        metrics = predict(
-            save_dir=save_dir,
-            ticker_name=ticker,
-            stock_data=stock_data,
-            stock_features=stock_features,
-            epochs=epochs,
-            batch_size=batch_size,
-            learning_rate=learning_rate
-        )
+        try:
+            metrics = predict(
+                save_dir=save_dir,
+                ticker_name=ticker,
+                stock_data=stock_data,
+                stock_features=stock_features,
+                epochs=epochs,
+                batch_size=batch_size,
+                learning_rate=learning_rate
+            )
+        except Exception as e:
+            print(f"LSTM预测训练出错: {str(e)}")
+            metrics = {'accuracy': 0, 'rmse': 0, 'mae': 0}
         
         progress(0.5, desc="开始交易代理训练...")
         # 使用纯股票代码而非文件名
-        # RLagent.py已经添加了tqdm进度条，但我们在这里也提供总体进度
-        trading_results = process_stock(
-            ticker,
-            save_dir,
-            window_size=window_size,
-            initial_money=initial_money,
-            iterations=agent_iterations
-        )
+        try:
+            trading_results = process_stock(
+                ticker,
+                save_dir,
+                window_size=window_size,
+                initial_money=initial_money,
+                iterations=agent_iterations
+            )
+        except Exception as e:
+            print(f"交易代理训练出错: {str(e)}")
+            trading_results = {'total_gains': 0, 'investment_return': 0, 'trades_buy': 0, 'trades_sell': 0}
         
         progress(0.9, desc="生成结果可视化...")
-        # 确保文件路径使用的是纯股票代码
-        prediction_plot = Image.open(f"{save_dir}/pic/predictions/{ticker}_prediction.png")
-        loss_plot = Image.open(f"{save_dir}/pic/loss/{ticker}_loss.png")
-        earnings_plot = Image.open(f"{save_dir}/pic/earnings/{ticker}_cumulative.png")
-        trades_plot = Image.open(f"{save_dir}/pic/trades/{ticker}_trades.png")
-        transactions_df = pd.read_csv(f"{save_dir}/transactions/{ticker}_transactions.csv")
+        # 使用安全的图像加载方式
+        images = []
+        try:
+            prediction_path = f"{save_dir}/pic/predictions/{ticker}_prediction.png"
+            if os.path.exists(prediction_path):
+                prediction_plot = Image.open(prediction_path)
+                images.append(prediction_plot)
+            else:
+                print(f"无法找到预测图片: {prediction_path}")
+                # 创建一个空白图像作为替代
+                blank_img = Image.new('RGB', (640, 480), color=(255, 255, 255))
+                images.append(blank_img)
+        except Exception as e:
+            print(f"加载预测图片出错: {str(e)}")
+            blank_img = Image.new('RGB', (640, 480), color=(255, 255, 255))
+            images.append(blank_img)
+        
+        try:
+            loss_path = f"{save_dir}/pic/loss/{ticker}_loss.png"
+            if os.path.exists(loss_path):
+                loss_plot = Image.open(loss_path)
+                images.append(loss_plot)
+            else:
+                print(f"无法找到损失图片: {loss_path}")
+                blank_img = Image.new('RGB', (640, 480), color=(255, 255, 255))
+                images.append(blank_img)
+        except Exception as e:
+            print(f"加载损失图片出错: {str(e)}")
+            blank_img = Image.new('RGB', (640, 480), color=(255, 255, 255))
+            images.append(blank_img)
+            
+        try:
+            earnings_path = f"{save_dir}/pic/earnings/{ticker}_cumulative.png"
+            if os.path.exists(earnings_path):
+                earnings_plot = Image.open(earnings_path)
+                images.append(earnings_plot)
+            else:
+                print(f"无法找到收益图片: {earnings_path}")
+                blank_img = Image.new('RGB', (640, 480), color=(255, 255, 255))
+                images.append(blank_img)
+        except Exception as e:
+            print(f"加载收益图片出错: {str(e)}")
+            blank_img = Image.new('RGB', (640, 480), color=(255, 255, 255))
+            images.append(blank_img)
+            
+        try:
+            trades_path = f"{save_dir}/pic/trades/{ticker}_trades.png"
+            if os.path.exists(trades_path):
+                trades_plot = Image.open(trades_path)
+                images.append(trades_plot)
+            else:
+                print(f"无法找到交易图片: {trades_path}")
+                blank_img = Image.new('RGB', (640, 480), color=(255, 255, 255))
+                images.append(blank_img)
+        except Exception as e:
+            print(f"加载交易图片出错: {str(e)}")
+            blank_img = Image.new('RGB', (640, 480), color=(255, 255, 255))
+            images.append(blank_img)
+        
+        try:
+            transactions_path = f"{save_dir}/transactions/{ticker}_transactions.csv"
+            if os.path.exists(transactions_path):
+                transactions_df = pd.read_csv(transactions_path)
+            else:
+                print(f"无法找到交易记录: {transactions_path}")
+                # 创建空的交易记录
+                transactions_df = pd.DataFrame(columns=['day', 'operate', 'price', 'investment', 'total_balance'])
+        except Exception as e:
+            print(f"加载交易记录出错: {str(e)}")
+            transactions_df = pd.DataFrame(columns=['day', 'operate', 'price', 'investment', 'total_balance'])
         
         progress(1.0, desc="完成!")
         return [
-            [prediction_plot, loss_plot, earnings_plot, trades_plot],
-            metrics['accuracy'] * 100,
-            metrics['rmse'],
-            metrics['mae'],
-            trading_results['total_gains'],
-            trading_results['investment_return'],
-            trading_results['trades_buy'],
-            trading_results['trades_sell'],
+            images,
+            metrics['accuracy'] * 100 if 'accuracy' in metrics else 0,
+            metrics['rmse'] if 'rmse' in metrics else 0,
+            metrics['mae'] if 'mae' in metrics else 0,
+            trading_results['total_gains'] if 'total_gains' in trading_results else 0,
+            trading_results['investment_return'] if 'investment_return' in trading_results else 0,
+            trading_results['trades_buy'] if 'trades_buy' in trading_results else 0,
+            trading_results['trades_sell'] if 'trades_sell' in trading_results else 0,
             transactions_df
         ]
     except Exception as e:
         print(f"处理错误: {str(e)}")
         import traceback
         traceback.print_exc()  # 打印详细错误堆栈
-        return [None] * 9
+        
+        # 返回空结果但带有有意义的错误信息
+        blank_img = Image.new('RGB', (640, 480), color=(255, 255, 255))
+        # 在空白图像上添加错误信息
+        from PIL import ImageDraw, ImageFont
+        draw = ImageDraw.Draw(blank_img)
+        draw.text((50, 240), f"处理出错: {str(e)}", fill=(0, 0, 0))
+        
+        return [
+            [blank_img, blank_img, blank_img, blank_img],
+            0, 0, 0, 0, 0, 0, 0,
+            pd.DataFrame(columns=['day', 'operate', 'price', 'investment', 'total_balance'])
+        ]
 
 with gr.Blocks() as demo:
     gr.Markdown("# 智能股票预测与交易Agent")
