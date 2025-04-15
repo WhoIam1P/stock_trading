@@ -12,6 +12,11 @@ import matplotlib.pyplot as plt
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 import matplotlib
+from datetime import datetime, timedelta
+import time
+import random
+import json
+
 # 设置matplotlib支持中文显示
 matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'SimSun', 'Arial Unicode MS']  # 优先使用的中文字体
 matplotlib.rcParams['axes.unicode_minus'] = False  # 解决保存图像负号'-'显示为方块的问题
@@ -163,7 +168,7 @@ def format_feature(df):
     # 确保所有列都存在
     for feature in selected_features:
         if feature not in df.columns:
-            print(f"警告: 无法计算特征 {feature}，使用默认值0")
+            print(f"警告: 无法找到特征 {feature}，使用默认值0")
             df[feature] = 0
     
     return df[selected_features]
@@ -509,7 +514,7 @@ def main():
     # 设置参数
     START_DATE = '2020-01-01'
     END_DATE = '2024-01-01'
-    NUM_FEATURES_TO_KEEP = 9
+    NUM_FEATURES_TO_KEEP = 11
     
     # 创建数据文件夹
     data_folder = 'data'

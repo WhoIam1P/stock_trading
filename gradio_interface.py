@@ -2,13 +2,15 @@ import gradio as gr
 import pandas as pd
 import torch
 import os
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import warnings
 import yfinance as yf
 from stock_prediction_lstm import predict, format_feature
 from RLagent import process_stock
 from datetime import datetime
 from process_stock_data import get_stock_data, clean_csv_files
+from stock_sentiment_analyzer import StockSentimentAnalyzer
+from process_stock_sentiment import StockNewsProcessor
 
 os.environ['HTTP_PROXY'] = 'http://127.0.0.1:7890'
 os.environ['HTTPS_PROXY'] = 'http://127.0.0.1:7890'
@@ -28,6 +30,8 @@ os.makedirs('tmp/gradio/pic/trades', exist_ok=True)
 os.makedirs('tmp/gradio/models', exist_ok=True)
 os.makedirs('tmp/gradio/transactions', exist_ok=True)
 os.makedirs('tmp/gradio/ticker', exist_ok=True)
+os.makedirs('tmp/gradio/sentiment', exist_ok=True)  # 情感分析结果目录
+os.makedirs('tmp/gradio/news', exist_ok=True)  # 新闻数据目录
 
 def get_data(ticker, start_date, end_date, progress=gr.Progress()):
     data_folder = 'tmp/gradio/ticker'
@@ -111,6 +115,249 @@ def validate_and_fix_data(file_path):
         print(f"已为 {file_path} 创建默认数据")
         return False
 
+# 新增情感分析处理函数
+def analyze_sentiment(temp_csv_path, uploaded_news_file=None, use_uploaded_news=False, 
+                      positive_threshold=0.2, negative_threshold=-0.2, 
+                      use_custom_thresholds=False, save_dir=SAVE_DIR, backtest=True, 
+                      news_file_path=None, progress=gr.Progress()):
+    """
+    执行情感分析并生成交易信号
+    
+    参数:
+        temp_csv_path: 股票价格数据文件路径
+        uploaded_news_file: 用户上传的自定义新闻数据文件路径
+        use_uploaded_news: 是否使用用户上传的新闻数据
+        positive_threshold: 正面情感阈值（高于此值触发买入信号）
+        negative_threshold: 负面情感阈值（低于此值触发卖出信号）
+        use_custom_thresholds: 是否使用自定义阈值（否则使用默认设置）
+        save_dir: 保存结果的目录
+        backtest: 是否执行回测
+        news_file_path: 通过获取新闻数据按钮生成的新闻文件路径
+        progress: Gradio进度条对象
+    """
+    if not temp_csv_path:
+        return [None] * 8, "请先获取股票价格数据"
+
+    try:
+        # 从文件路径中提取股票代码（去掉.csv后缀）
+        ticker = os.path.basename(temp_csv_path).split('.')[0]
+        
+        progress(0.1, desc="初始化情感分析器...")
+        
+        # 确保sentiment目录存在
+        os.makedirs(f"{save_dir}/sentiment", exist_ok=True)
+        os.makedirs(f"{save_dir}/pic", exist_ok=True)
+        
+        # 初始化情感分析器
+        analyzer = StockSentimentAnalyzer(data_dir=f"{save_dir}/sentiment")
+        
+        # 读取价格数据
+        progress(0.2, desc="读取股票价格数据...")
+        price_data = pd.read_csv(temp_csv_path)
+        
+        # 标准化列名
+        if 'Date' in price_data.columns:
+            price_data.rename(columns={'Date': 'date'}, inplace=True)
+        if 'Close' in price_data.columns:
+            price_data.rename(columns={'Close': 'close'}, inplace=True)
+            
+        price_data['date'] = pd.to_datetime(price_data['date'])
+        
+        # 确定使用哪个新闻文件
+        news_file = None
+        if use_uploaded_news and uploaded_news_file:
+            news_file = uploaded_news_file
+            progress(0.25, desc="使用上传的自定义新闻数据...")
+        elif news_file_path:
+            news_file = news_file_path
+            progress(0.25, desc="使用自动获取的新闻数据...")
+        else:
+            # 尝试在不同可能的位置查找新闻数据
+            possible_paths = [
+                f"./data/{ticker}_news.csv",
+                f"./data/news/{ticker}_news.csv",
+                f"{save_dir}/news/{ticker}_news.csv",
+                f"{save_dir}/sentiment/{ticker}_news.csv"
+            ]
+            
+            for path in possible_paths:
+                if os.path.exists(path):
+                    news_file = path
+                    progress(0.25, desc=f"找到现有新闻数据: {os.path.basename(path)}...")
+                    break
+            
+            if not news_file:
+                return [None] * 8, f"找不到{ticker}的新闻数据文件，请先获取新闻数据"
+                
+        progress(0.3, desc="分析新闻情感...")
+        # 分析新闻情感
+        news_with_sentiment = analyzer.analyze_news_file(news_file, ticker)
+        
+        if news_with_sentiment.empty:
+            return [None] * 8, f"无法从{news_file}分析情感"
+            
+        progress(0.4, desc="聚合每日情感...")
+        # 聚合每日情感
+        daily_sentiment = analyzer.aggregate_daily_sentiment(news_with_sentiment)
+        
+        # 保存初步的每日情感数据
+        daily_sentiment_filename = f"{ticker}_daily_sentiment.csv"
+        analyzer.save_sentiment_data(daily_sentiment, ticker, file_name=daily_sentiment_filename)
+        
+        progress(0.5, desc="合并情感与价格数据...")
+        # 合并情感和价格数据
+        merged_data = analyzer.merge_with_price_data(daily_sentiment, price_data)
+        
+        progress(0.6, desc="生成可视化...")
+        # 生成基础可视化
+        analyzer.plot_sentiment_vs_price(merged_data, ticker, output_dir=f"{save_dir}/pic")
+        analyzer.visualize_sentiment_metrics(merged_data, ticker, output_dir=f"{save_dir}/pic")
+        
+        # 分析情感效应
+        effect_results = analyzer.analyze_sentiment_effect(merged_data)
+        
+        progress(0.7, desc="生成交易信号...")
+        # 生成交易信号（使用自定义阈值或默认阈值）
+        if use_custom_thresholds:
+            data_with_signals = analyzer.generate_trading_signals(
+                merged_data, 
+                positive_threshold=positive_threshold,
+                negative_threshold=negative_threshold
+            )
+        else:
+            data_with_signals = analyzer.generate_trading_signals(merged_data)
+        
+        # 绘制交易信号
+        analyzer.plot_trading_signals(data_with_signals, ticker, output_dir=f"{save_dir}/pic")
+        
+        # 保存带有信号的数据
+        merged_signals_filename = f"{ticker}_with_sentiment_signals.csv"
+        analyzer.save_sentiment_data(data_with_signals, ticker, file_name=merged_signals_filename)
+        
+        # 回测交易策略（如果启用）
+        backtest_results = {}
+        if backtest:
+            progress(0.8, desc="执行交易策略回测...")
+            backtest_results = analyzer.backtest_trading_strategy(data_with_signals)
+            
+            if backtest_results and 'summary' in backtest_results:
+                analyzer.plot_backtest_results(backtest_results, ticker, output_dir=f"{save_dir}/pic")
+                
+                # 保存回测摘要
+                backtest_summary_df = pd.DataFrame([backtest_results['summary']])
+                backtest_summary_df.to_csv(f"{save_dir}/sentiment/{ticker}_backtest_summary.csv", index=False)
+                
+                # 保存交易记录
+                if backtest_results.get('positions'):
+                    trades_df = pd.DataFrame(backtest_results['positions'])
+                    trades_df.to_csv(f"{save_dir}/sentiment/{ticker}_trades.csv", index=False)
+        
+        progress(0.9, desc="加载图像结果...")
+        # 加载图像结果
+        images = []
+        try:
+            sentiment_price_path = f"{save_dir}/pic/{ticker}_sentiment_vs_price.png"
+            if os.path.exists(sentiment_price_path):
+                sentiment_price_img = Image.open(sentiment_price_path)
+                images.append(sentiment_price_img)
+            else:
+                blank_img = Image.new('RGB', (640, 480), color=(255, 255, 255))
+                images.append(blank_img)
+                
+            sentiment_metrics_path = f"{save_dir}/pic/{ticker}_sentiment_metrics.png"
+            if os.path.exists(sentiment_metrics_path):
+                sentiment_metrics_img = Image.open(sentiment_metrics_path)
+                images.append(sentiment_metrics_img)
+            else:
+                blank_img = Image.new('RGB', (640, 480), color=(255, 255, 255))
+                images.append(blank_img)
+                
+            trading_signals_path = f"{save_dir}/pic/{ticker}_trading_signals.png"
+            if os.path.exists(trading_signals_path):
+                trading_signals_img = Image.open(trading_signals_path)
+                images.append(trading_signals_img)
+            else:
+                blank_img = Image.new('RGB', (640, 480), color=(255, 255, 255))
+                images.append(blank_img)
+                
+            if backtest and backtest_results:
+                backtest_path = f"{save_dir}/pic/{ticker}_backtest_results.png"
+                if os.path.exists(backtest_path):
+                    backtest_img = Image.open(backtest_path)
+                    images.append(backtest_img)
+                else:
+                    blank_img = Image.new('RGB', (640, 480), color=(255, 255, 255))
+                    images.append(blank_img)
+            else:
+                blank_img = Image.new('RGB', (640, 480), color=(255, 255, 255))
+                images.append(blank_img)
+        except Exception as e:
+            print(f"加载图像出错: {str(e)}")
+            blank_img = Image.new('RGB', (640, 480), color=(255, 255, 255))
+            images = [blank_img, blank_img, blank_img, blank_img]
+        
+        # 获取交易记录
+        trades_df = pd.DataFrame()
+        try:
+            trades_path = f"{save_dir}/sentiment/{ticker}_trades.csv"
+            if os.path.exists(trades_path):
+                trades_df = pd.read_csv(trades_path)
+        except Exception as e:
+            print(f"加载交易记录出错: {str(e)}")
+        
+        # 准备情感分析摘要
+        sentiment_summary = {
+            'average_sentiment': merged_data['sentiment_score'].mean() if not merged_data.empty else 0,
+            'positive_days': len(merged_data[merged_data['sentiment_score'] > 0]) if not merged_data.empty else 0,
+            'negative_days': len(merged_data[merged_data['sentiment_score'] < 0]) if not merged_data.empty else 0,
+            'neutral_days': len(merged_data[merged_data['sentiment_score'] == 0]) if not merged_data.empty else 0,
+            'correlation_with_price': effect_results.get('correlation', 0) if effect_results else 0,
+            'avg_price_change_after_positive': effect_results.get('avg_change_after_positive', 0) if effect_results else 0,
+            'avg_price_change_after_negative': effect_results.get('avg_change_after_negative', 0) if effect_results else 0
+        }
+        
+        # 准备回测结果摘要
+        backtest_summary = {}
+        if backtest_results and 'summary' in backtest_results:
+            backtest_summary = {
+                'total_return': backtest_results['summary'].get('total_return', 0),
+                'annualized_return': backtest_results['summary'].get('annualized_return', 0),
+                'total_trades': backtest_results['summary'].get('total_trades', 0),
+                'win_rate': backtest_results['summary'].get('win_rate', 0),
+                'profit_factor': backtest_results['summary'].get('profit_factor', 0),
+                'max_drawdown': backtest_results['summary'].get('max_drawdown', 0)
+            }
+        
+        progress(1.0, desc="情感分析完成!")
+        
+        return [
+            images,
+            sentiment_summary['average_sentiment'],
+            sentiment_summary['positive_days'],
+            sentiment_summary['negative_days'],
+            sentiment_summary['correlation_with_price'],
+            backtest_summary.get('total_return', 0),
+            backtest_summary.get('win_rate', 0),
+            trades_df,
+            "情感分析完成"
+        ]
+    
+    except Exception as e:
+        print(f"情感分析处理出错: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        
+        blank_img = Image.new('RGB', (640, 480), color=(255, 255, 255))
+        draw = ImageDraw.Draw(blank_img)
+        draw.text((50, 240), f"处理出错: {str(e)}", fill=(0, 0, 0))
+        
+        return [
+            [blank_img, blank_img, blank_img, blank_img],
+            0, 0, 0, 0, 0, 0,
+            pd.DataFrame(),
+            f"情感分析出错: {str(e)}"
+        ]
+
 def process_and_predict(temp_csv_path, epochs, batch_size, learning_rate, 
                        window_size, initial_money, agent_iterations, save_dir, progress=gr.Progress()):
     if not temp_csv_path:
@@ -161,7 +408,8 @@ def process_and_predict(temp_csv_path, epochs, batch_size, learning_rate,
                 save_dir,
                 window_size=window_size,
                 initial_money=initial_money,
-                iterations=agent_iterations
+                iterations=agent_iterations,
+                use_sentiment=True  # 尝试使用情感分析数据
             )
         except Exception as e:
             print(f"交易代理训练出错: {str(e)}")
@@ -259,7 +507,6 @@ def process_and_predict(temp_csv_path, epochs, batch_size, learning_rate,
         # 返回空结果但带有有意义的错误信息
         blank_img = Image.new('RGB', (640, 480), color=(255, 255, 255))
         # 在空白图像上添加错误信息
-        from PIL import ImageDraw, ImageFont
         draw = ImageDraw.Draw(blank_img)
         draw.text((50, 240), f"处理出错: {str(e)}", fill=(0, 0, 0))
         
@@ -269,11 +516,74 @@ def process_and_predict(temp_csv_path, epochs, batch_size, learning_rate,
             pd.DataFrame(columns=['day', 'operate', 'price', 'investment', 'total_balance'])
         ]
 
+def get_news_data(ticker, start_date, end_date, max_articles=500, progress=gr.Progress()):
+    """
+    获取指定股票的新闻数据
+    
+    参数:
+        ticker: 股票代码
+        start_date: 开始日期 (YYYY-MM-DD)
+        end_date: 结束日期 (YYYY-MM-DD)
+        max_articles: 最大获取文章数量
+        progress: Gradio进度条对象
+    
+    返回:
+        新闻数据文件路径, 状态信息
+    """
+    news_folder = 'tmp/gradio/news'
+    os.makedirs(news_folder, exist_ok=True)
+    
+    try:
+        # 初始化新闻处理器
+        progress(0.1, desc="初始化新闻处理器...")
+        processor = StockNewsProcessor(output_dir=news_folder)
+        
+        # 计算日期范围天数
+        start_date_dt = datetime.strptime(start_date, '%Y-%m-%d')
+        end_date_dt = datetime.strptime(end_date, '%Y-%m-%d')
+        date_range_days = (end_date_dt - start_date_dt).days
+        
+        # 调整max_articles
+        adjusted_max = max(max_articles, min(date_range_days * 2, 1000))
+        progress(0.2, desc=f"开始获取{ticker}的新闻数据 (最多{adjusted_max}篇)...")
+        
+        # 获取新闻数据
+        news_df = processor.process_stock_news(
+            ticker,
+            start_date=start_date,
+            end_date=end_date,
+            max_articles=adjusted_max
+        )
+        
+        if news_df.empty:
+            return None, f"未找到{ticker}在指定日期范围内的新闻数据"
+        
+        progress(0.7, desc="预处理新闻数据...")
+        # 预处理数据
+        from process_stock_sentiment import preprocess_news_data
+        news_df = preprocess_news_data(news_df)
+        
+        # 保存文件
+        progress(0.9, desc="保存新闻数据...")
+        file_name = f"{ticker}_news_from_{start_date}_to_{end_date.replace('-', '')}.csv"
+        file_path = os.path.join(news_folder, file_name)
+        news_df.to_csv(file_path, index=False)
+        
+        progress(1.0, desc="新闻数据获取完成")
+        return file_path, f"成功获取{len(news_df)}条{ticker}的新闻数据"
+        
+    except Exception as e:
+        progress(1.0, desc="获取新闻数据出错")
+        import traceback
+        traceback.print_exc()
+        return None, f"获取新闻数据出错: {str(e)}"
+
 with gr.Blocks() as demo:
     gr.Markdown("# 智能股票预测与交易Agent")
     
     save_dir_state = gr.State(value='tmp/gradio')
     temp_csv_state = gr.State(value=None)
+    news_file_state = gr.State(value=None)
     
     with gr.Row():
         with gr.Column(scale=2):
@@ -289,15 +599,26 @@ with gr.Blocks() as demo:
                 value=datetime.now().strftime('%Y-%m-%d')
             )
         with gr.Column(scale=1):
-            fetch_button = gr.Button("获取数据")
+            fetch_button = gr.Button("获取价格数据")
     
     with gr.Row():
         status_output = gr.Textbox(label="状态信息", interactive=False)
     
     with gr.Row():
-        data_file = gr.File(label="下载股票数据", visible=True, interactive=False)
+        data_file = gr.File(label="下载股票价格数据", visible=True, interactive=False)
+        
+    with gr.Row():
+        max_articles = gr.Slider(minimum=100, maximum=1000, value=500, step=50, 
+                               label="最大获取新闻文章数量")
+        fetch_news_button = gr.Button("获取新闻数据", interactive=False)
+        
+    with gr.Row():
+        news_status_output = gr.Textbox(label="新闻数据状态", interactive=False)
+        
+    with gr.Row():
+        news_file = gr.File(label="下载股票新闻数据", visible=True, interactive=False)
     
-    with gr.Tabs():
+    with gr.Tabs() as tabs:
         with gr.TabItem("LSTM预测参数"):
             with gr.Column():
                 lstm_epochs = gr.Slider(minimum=100, maximum=1000, value=500, step=10, 
@@ -314,40 +635,88 @@ with gr.Blocks() as demo:
                 initial_money = gr.Number(value=10000, label="初始投资金额 ($)")
                 agent_iterations = gr.Slider(minimum=100, maximum=1000, value=500, 
                                           step=50, label="代理训练迭代次数")
-    
-    with gr.Row():
-        train_button = gr.Button("开始训练", interactive=False)
-    
-    with gr.Row():
-        output_gallery = gr.Gallery(label="分析结果可视化", show_label=True,
-                                  elem_id="gallery", columns=4, rows=1,
-                                  height="auto", object_fit="contain")
-    
-    with gr.Row():
-        with gr.Column(scale=1):
-            gr.Markdown("### 预测指标")
-            accuracy_output = gr.Number(label="预测准确率 (%)")
-            rmse_output = gr.Number(label="RMSE (均方根误差)")
-            mae_output = gr.Number(label="MAE (平均绝对误差)")
         
-        with gr.Column(scale=1):
-            gr.Markdown("### 交易指标")
-            gains_output = gr.Number(label="总收益 ($)")
-            return_output = gr.Number(label="投资回报率 (%)")
-            trades_buy_output = gr.Number(label="买入次数")
-            trades_sell_output = gr.Number(label="卖出次数")
+        # 新增情感分析参数选项卡
+        with gr.TabItem("情感分析参数"):
+            with gr.Column():
+                uploaded_news_file = gr.File(label="上传自定义新闻数据文件（可选）", visible=True)
+                use_uploaded_news = gr.Checkbox(label="使用上传的自定义新闻数据", value=False)
+                positive_threshold = gr.Slider(minimum=0.0, maximum=1.0, value=0.2, step=0.05,
+                                            label="正面情感阈值（触发买入信号）")
+                negative_threshold = gr.Slider(minimum=-1.0, maximum=0.0, value=-0.2, step=0.05,
+                                            label="负面情感阈值（触发卖出信号）")
+                use_custom_thresholds = gr.Checkbox(label="使用自定义阈值", value=False)
+                run_backtest = gr.Checkbox(label="执行回测分析", value=True)
     
     with gr.Row():
-        gr.Markdown("### 交易记录")
-        transactions_df = gr.DataFrame(
-            headers=["day", "operate", "price", "investment", "total_balance"],
-            label="交易详细记录"
-        )
+        train_button = gr.Button("开始LSTM与交易代理训练", interactive=False)
+        sentiment_button = gr.Button("执行情感分析", interactive=False)
+    
+    # 创建结果显示区域的标签页
+    with gr.Tabs() as result_tabs:
+        # LSTM及交易代理结果标签页
+        with gr.TabItem("预测与交易结果"):
+            with gr.Row():
+                output_gallery = gr.Gallery(label="预测与交易结果可视化", show_label=True,
+                                          elem_id="gallery", columns=4, rows=1,
+                                          height="auto", object_fit="contain")
+            
+            with gr.Row():
+                with gr.Column(scale=1):
+                    gr.Markdown("### 预测指标")
+                    accuracy_output = gr.Number(label="预测准确率 (%)")
+                    rmse_output = gr.Number(label="RMSE (均方根误差)")
+                    mae_output = gr.Number(label="MAE (平均绝对误差)")
+                
+                with gr.Column(scale=1):
+                    gr.Markdown("### 交易指标")
+                    gains_output = gr.Number(label="总收益 ($)")
+                    return_output = gr.Number(label="投资回报率 (%)")
+                    trades_buy_output = gr.Number(label="买入次数")
+                    trades_sell_output = gr.Number(label="卖出次数")
+            
+            with gr.Row():
+                gr.Markdown("### 交易记录")
+                transactions_df = gr.DataFrame(
+                    headers=["day", "operate", "price", "investment", "total_balance"],
+                    label="交易详细记录"
+                )
+        
+        # 情感分析结果标签页
+        with gr.TabItem("情感分析结果"):
+            with gr.Row():
+                sentiment_gallery = gr.Gallery(label="情感分析可视化", show_label=True,
+                                             elem_id="sentiment_gallery", columns=4, rows=1,
+                                             height="auto", object_fit="contain")
+            
+            with gr.Row():
+                with gr.Column(scale=1):
+                    gr.Markdown("### 情感指标")
+                    avg_sentiment = gr.Number(label="平均情感得分")
+                    positive_days = gr.Number(label="正面情感天数")
+                    negative_days = gr.Number(label="负面情感天数")
+                    sentiment_correlation = gr.Number(label="情感与价格相关性")
+                
+                with gr.Column(scale=1):
+                    gr.Markdown("### 回测指标")
+                    backtest_return = gr.Number(label="回测总回报率 (%)")
+                    backtest_win_rate = gr.Number(label="胜率 (%)")
+            
+            with gr.Row():
+                gr.Markdown("### 情感交易记录")
+                sentiment_trades_df = gr.DataFrame(
+                    headers=["date", "action", "price", "shares", "portfolio_value"],
+                    label="情感交易详细记录"
+                )
+                
+            with gr.Row():
+                sentiment_status = gr.Textbox(label="情感分析状态", interactive=False)
     
     def update_interface(csv_path):
         return (
             csv_path if csv_path else None,  # 更新文件下载
-            gr.update(interactive=bool(csv_path))  # 更新训练按钮
+            gr.update(interactive=bool(csv_path)),  # 更新训练按钮
+            gr.update(interactive=bool(csv_path))   # 更新新闻获取按钮
         )
     
     # 获取数据按钮事件
@@ -361,7 +730,27 @@ with gr.Blocks() as demo:
     fetch_result.then(
         update_interface,
         inputs=[temp_csv_state],
-        outputs=[data_file, train_button]
+        outputs=[data_file, train_button, fetch_news_button]
+    )
+    
+    # 获取新闻数据按钮事件
+    fetch_news_result = fetch_news_button.click(
+        fn=get_news_data,
+        inputs=[ticker_input, start_date, end_date, max_articles],
+        outputs=[news_file_state, news_status_output]
+    )
+    
+    # 更新新闻文件下载状态和情感分析按钮
+    def update_news_interface(news_path):
+        return (
+            news_path if news_path else None,  # 更新新闻文件下载
+            gr.update(interactive=bool(news_path))  # 更新情感分析按钮
+        )
+    
+    fetch_news_result.then(
+        update_news_interface,
+        inputs=[news_file_state],
+        outputs=[news_file, sentiment_button]
     )
     
     # 训练按钮事件
@@ -387,6 +776,33 @@ with gr.Blocks() as demo:
             trades_buy_output,
             trades_sell_output,
             transactions_df
+        ]
+    )
+    
+    # 情感分析按钮事件
+    sentiment_button.click(
+        fn=analyze_sentiment,
+        inputs=[
+            temp_csv_state,
+            uploaded_news_file,
+            use_uploaded_news,
+            positive_threshold,
+            negative_threshold,
+            use_custom_thresholds,
+            save_dir_state,
+            run_backtest,
+            news_file_state  # 添加新闻文件路径
+        ],
+        outputs=[
+            sentiment_gallery,
+            avg_sentiment,
+            positive_days,
+            negative_days,
+            sentiment_correlation,
+            backtest_return,
+            backtest_win_rate,
+            sentiment_trades_df,
+            sentiment_status
         ]
     )
 
